@@ -8,6 +8,37 @@
     <p class="hint">所有半决赛/决赛场次都在这里：现行、手动撤下、因小组对阵更新而封存的记录及其比分均可查。重新配对一定产生空白的新场次。</p>
   </div>
 
+  {% if sf_conflicts and sf_conflicts.has_conflict %}
+  <div class="alert alert-conflict conflict-banner" id="sf-conflicts"
+       role="alert" data-testid="history-conflict-banner">
+    <strong>⛔ 现行半决赛存在重复排人：</strong>
+    <ul class="conflict-list">
+      {% for item in sf_conflicts.players %}
+      <li data-testid="history-conflict-player-{{ item.player_id }}">
+        {{ item.player_name }}（抽签 {{ item.draw_no }} 号）同时在
+        {% for cm in item.matches %}
+          <a class="conflict-match-link"
+             href="{{ url_for('web.match_page', match_id=cm.id) }}"
+             data-testid="history-conflict-match-{{ cm.id }}">{{ cm.ref_label }}</a>{% if not loop.last %}、{% endif %}
+        {% endfor %}
+      </li>
+      {% endfor %}
+      {% for sm in sf_conflicts.self_matches %}
+      <li data-testid="history-self-match-{{ sm.id }}">
+        <a class="conflict-match-link"
+           href="{{ url_for('web.match_page', match_id=sm.id) }}"
+           data-testid="history-conflict-match-{{ sm.id }}">{{ sm.ref_label }}</a>
+        为自己对自己的无效对阵。
+      </li>
+      {% endfor %}
+    </ul>
+    <p class="hint" style="margin-bottom:0">
+      重配接口/表单现在会拒绝把已在另一场现行半决赛的球员再次排人（并发提交也只有一份成功）；
+      下列涉冲突场次的比分仍可正常查询。
+    </p>
+  </div>
+  {% endif %}
+
   <div class="card">
     <h3>重新配对 / 新建配对</h3>
     <form method="post" action="{{ url_for('web.create_pairing') }}"
@@ -46,8 +77,10 @@
       </thead>
       <tbody>
       {% for m in matches %}
-        <tr class="{{ 'row-withdrawn' if m.status == 'withdrawn' else '' }}"
-            data-testid="history-row-{{ m.id }}" data-status="{{ m.status }}">
+        {% set row_conflict = sf_conflicts and m.id in sf_conflicts.match_ids %}
+        <tr class="{{ 'row-withdrawn' if m.status == 'withdrawn' else '' }} {{ 'row-conflict' if row_conflict else '' }}"
+            data-testid="history-row-{{ m.id }}" data-status="{{ m.status }}"
+            {% if row_conflict %}data-conflict="1"{% endif %}>
           <td>#{{ m.id }}</td>
           <td>
             {% if m.round == 'SF' %}半决赛
@@ -58,12 +91,20 @@
             {% elif m.bracket_code == 'REPAIR' %}
               <span class="badge badge-repair">重配</span>
             {% endif %}
+            {% if row_conflict %}
+              <span class="badge badge-conflict"
+                    data-testid="history-conflict-badge-{{ m.id }}">⛔ 重复排人</span>
+            {% endif %}
           </td>
           <td>{{ m.table_no if m.table_no in [1,2] else '—' }}{% if m.table_no == 1 %}号台{% elif m.table_no == 2 %}号台{% endif %}</td>
           <td class="matchup-cell">
-            {{ m.player1_name or '待定' }}
+            <span class="{{ 'player-conflict-mark' if sf_conflicts and m.player1_id in sf_conflicts.player_ids else '' }}">
+              {{ m.player1_name or '待定' }}
+            </span>
             <span class="muted">vs</span>
-            {{ m.player2_name or '待定' }}
+            <span class="{{ 'player-conflict-mark' if sf_conflicts and m.player2_id in sf_conflicts.player_ids else '' }}">
+              {{ m.player2_name or '待定' }}
+            </span>
           </td>
           <td class="score-cell" data-testid="history-score-{{ m.id }}">
             {% if m.score1 is not none %}
@@ -81,7 +122,9 @@
           </td>
           <td class="muted small">
             {% if m.status == 'withdrawn' %}
-              {{ '小组对阵更新封存' if m.withdraw_reason == 'lineup_update' else '手动撤场' }}
+              {% if m.withdraw_reason == 'lineup_update' %}小组对阵更新封存
+              {% elif m.withdraw_reason == 'sf_conflict' %}半决赛重复排人冲突，决赛暂停/封存
+              {% else %}手动撤场{% endif %}
               <br>{{ m.withdrawn_at or '' }}
             {% else %}
               创建 {{ m.created_at }}

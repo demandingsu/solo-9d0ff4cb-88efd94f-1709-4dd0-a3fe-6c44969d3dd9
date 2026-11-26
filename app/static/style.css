@@ -270,3 +270,76 @@ input[type="number"]:focus, select:focus {
   .vs-player { justify-content: center; }
   .topbar-inner { justify-content: center; text-align: center; }
 }
+
+/* ------------------------------------------------------------------ */
+/* 重复排人冲突：横幅、卡片/行/球员标记、决赛暂停                       */
+/* ------------------------------------------------------------------ */
+.alert-conflict {
+  background: var(--red-050);
+  border: 1px solid #ffa8a8;
+  border-left: 5px solid var(--red-600);
+  border-radius: 12px;
+  padding: 13px 16px;
+  margin-bottom: 16px;
+  color: #a61e1e;
+}
+.conflict-banner { box-shadow: 0 0 0 3px rgba(201, 42, 42, .08); }
+.conflict-banner .conflict-list { margin: 8px 0 6px; padding-left: 20px; }
+.conflict-banner .conflict-list li { margin: 4px 0; }
+.conflict-match-link {
+  color: var(--red-600);
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.conflict-match-link:hover { color: #7a1818; }
+.conflict-actions-hint { margin: 6px 0 0; font-size: .92rem; }
+
+.badge-conflict {
+  background: var(--red-600);
+  color: #fff;
+  font-weight: 700;
+}
+
+.player-conflict-mark {
+  background: #ffe3e3;
+  color: var(--red-600);
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-weight: 800;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+.conflict-inline {
+  display: inline-block;
+  margin-left: 4px;
+  font-size: .72rem;
+  font-weight: 800;
+  color: #fff;
+  background: var(--red-600);
+  border-radius: 999px;
+  padding: 1px 7px;
+  vertical-align: middle;
+}
+
+.table-card.card-conflict {
+  border: 2px solid #ffa8a8;
+  box-shadow: 0 0 0 3px rgba(201, 42, 42, .10), var(--shadow);
+}
+.conflict-row-text {
+  color: var(--red-600);
+  font-weight: 700;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--red-050);
+}
+
+.history-table tr.row-conflict {
+  background: #fff5f5;
+  box-shadow: inset 4px 0 0 var(--red-600);
+}
+.history-table tr.row-conflict td { border-top-color: #ffc9c9; border-bottom-color: #ffc9c9; }
+
+.final-suspended .pending-conflict { color: var(--red-600); font-weight: 700; }
+.final-blocked-box h3 { margin-top: 0; color: var(--red-600); }
+.final-blocked-box .btn { margin-top: 6px; }

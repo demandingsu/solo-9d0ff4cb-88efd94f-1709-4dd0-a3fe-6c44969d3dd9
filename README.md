@@ -5,6 +5,14 @@
 自动排名、半决赛对阵、按场记分、球台对调、撤场封存、同两人重新配对、旧页面交分裁决，
 并在两场现行半决赛都有比分后才显示决赛选手（另附轻量决赛/冠军）。
 
+> **重复排人防护（本次修复重点）**：同一名球员不能再被排进两场现行半决赛；给空台重配时
+> 若该球员已在另一场现行半决赛，提交会被退回并指出冲突场次（JSON 409
+> `sf_player_conflict`，表单 302 定位到 `/#match-<冲突场次>`）。“查重 + 占台 + 插入”在
+> `BEGIN IMMEDIATE` 串行写事务中完成，两个裁判同时给两张空台排同一人也只有一份成功。
+> 对库里**已经存在**的重复赛程，网页会用红色横幅/卡片/行内标记标出球员与场次，比分照常可查；
+> 冲突期间暂停晋级、决赛记分与冠军展示；撤下重复场合并补齐两场合规赛果后，按有效胜者重建
+> 决赛，原先据冲突赛程产生的决赛比分以 `sf_conflict` 原因封存、历史页可查。
+
 ---
 
 ## 1. 快速开始
@@ -37,12 +45,37 @@ python wsgi.py
 
 ```bash
 pip install pytest
-pytest -q                                   # 15 个行为测试
+pytest -q                                   # 25 个行为/并发测试
 
 # 先起服务，再跑纯标准库黑盒剧本（对调球台 + 撤场重配 + 旧页交分）
 DB_PATH=/tmp/trial.db gunicorn --bind 127.0.0.1:5555 --preload wsgi:app &
 python scripts/e2e_trial.py http://127.0.0.1:5555
+
+# 重复排人拦截 + 已有冲突的网页标注/冻结 + 撤场恢复/旧决赛封存（33 项）
+python scripts/e2e_conflict_recovery.py http://127.0.0.1:5555 \
+    --db-path /tmp/trial.db     # --db-path 会注入旧 bug 脏赛程（清空 matches 表）
+
+# 两个裁判并发给两张空台排同一人（默认 8 轮，每轮都断言只有一份成功）
+python scripts/e2e_concurrent_repair.py http://127.0.0.1:5555 --rounds 10
 ```
+
+#### 用 Docker Compose 做冲突/并发试跑
+
+```bash
+PORT=5000 docker compose up --build -d
+# 冲突 + 恢复（脚本已 COPY 进镜像；直接打容器内端口与 /data 下的库）
+docker compose exec referee python3 scripts/e2e_conflict_recovery.py \
+    http://127.0.0.1:5000 --db-path /data/referee.db
+# 并发重配
+docker compose exec referee python3 scripts/e2e_concurrent_repair.py \
+    http://127.0.0.1:5000 --rounds 10
+# 或手动注入同一份脏赛程用于在浏览器里查看标注：
+docker compose exec referee python3 scripts/dev_inject_conflict.py
+```
+
+> 注意：`e2e_conflict_recovery.py --db-path` 与 `dev_inject_conflict.py` 会
+> **清空 `matches` 表**并写入固定的冲突演示数据，只能用于一次性试跑库，
+> 不要对正式裁判库执行。
 
 ---
 
@@ -85,6 +118,39 @@ python scripts/e2e_trial.py http://127.0.0.1:5555
 - 球员对已不在最新对阵中：
   - 从未记分的自动空壳 → 删除，避免历史噪音；
   - 已记分或人工重配场次 → 标记 `withdrawn / lineup_update`，比分封存可查，再生成空白新场。
+- 一旦现行半决赛本身存在“同一球员在两场 / 自己对自己”的重复排人冲突，调和直接跳过、
+  保留现场供裁判撤场处理（见下节），不会用自动对阵把冲突痕迹覆盖掉。
+
+### 重复排人防护、冲突标注与恢复
+
+旧版只防“同一对球员重复”和“同一张台重复”，没防“**同一名球员出现在两场现行半决赛**”，
+于是裁判撤下一场、给空台重配时，可以把另一场仍在打的球员再排一次；该球员若两场都赢，
+还会生成 `player1_id == player2_id` 的“自己和自己打”的决赛。修复后的规则：
+
+1. **写入拦截**：`create_repair()` 在 `BEGIN IMMEDIATE` 写事务内依次查
+   “同对现行场次 → 任一球员已在另一场现行 SF → 球台占用”，命中球员冲突即抛
+   `PlayerAlreadyScheduledError`，文案与 JSON `conflicts` 都带冲突场次 `#id`/球台/对阵。
+   写锁把并发“查重 + 插入”串行化，后到的裁判一定看得到先提交的排人；另有
+   `uq_active_pair` / `uq_active_table` 两个部分唯一索引兜底。
+2. **存量脏赛程只标注、不崩页、不自动抹掉**：`semifinal_conflict_report()` 找出
+   “同一球员在 ≥2 场不同现行 SF”和“自己对自己”两类冲突。首页 `#sf-conflicts` 红色横幅、
+   冲突卡片红框、`⛔ 重复排人` 徽标、球员名红底标记；历史页同样有横幅与行标记。
+   所有已录比分原样渲染、可查。检测到冲突时 `reconcile_semifinals()` 不做自动调和，
+   保留现场（重启也不会把冲突痕迹悄悄改掉）。
+3. **冲突期间冻结晋级**：`finalists_state.ready=False` 且 `conflict=True`、不返回胜者；
+   首页显示 `final-suspended`，不显示决赛记分表单与冠军；`champion()` 也加了冲突闸门。
+   直接 `POST /matches/<决赛id>/score` 会被 **409 `semifinal_conflict`** 退回；若该决赛仍
+   active，其独立页面用 `final-score-blocked` 面板替换记分表单。
+4. **冲突决赛封存**：`reconcile_final()` 的冲突分支把 active 且有比分的决赛置
+   `withdrawn / sf_conflict`（空白空壳删除），比分保留；裁判撤下冲突 SF 时也会先做同样的
+   封存，保证历史页的封存原因准确。
+5. **恢复**：撤下重复 SF → 在空台补齐合规对阵（或重新整表提交触发调和）→ 两场都有有效
+   比分后，`reconcile_final()` 按两位有效胜者生成 pair 不同的空白新决赛；旧冲突决赛保持
+   withdrawn，比分与“半决赛重复排人冲突，决赛暂停/封存”原因在历史页/旧链接可查。
+
+新增机器码：`sf_player_conflict`（重配被退回，409）、`semifinal_conflict`
+（冲突期间决赛交分被退回，409）；`GET /api/state` 新增 `sf_conflicts` 与
+`finalists.conflict/conflicts` 字段。
 
 ---
 
@@ -118,9 +184,10 @@ python scripts/e2e_trial.py http://127.0.0.1:5555
 比分规则：两格必须同时填写；允许 0–999 的整数（可填局分或小分）；
 乒乓球必须分胜负，**双方相等会被拒绝**并给出中文错误（小组整表为原子提交，任一场不合法则六场都不入库）。
 
-决赛选手判定：现行半决赛**恰好两场且两场都有可分胜负的比分**时，
-`#finalists` 区域才显示两位决赛选手；否则显示 `已完成 x/y` 与原因。
-决赛选手产生后会出现轻量决赛记分与冠军横幅（加分项）。
+决赛选手判定：现行半决赛**恰好两场、两场所属球员互不重复（无冲突）且两场都有可分胜负的比分**时，
+`#finalists` 区域才显示两位决赛选手；人数不足显示 `已完成 x/y` 与原因，存在重复排人时显示
+`final-suspended` 冲突暂停说明。决赛选手产生后会出现轻量决赛记分与冠军横幅（加分项），
+但冲突期间决赛入口/记分/冠军一律冻结（见上节）。
 
 ---
 
@@ -138,40 +205,80 @@ python scripts/e2e_trial.py http://127.0.0.1:5555
 - ✅ **同两人重新配对生成全新空白场次，重新记分**；重复的现行同对配对会被 409/提示拦截。
 - ✅ **已撤下场次的旧页面交分被退回 HTTP 409，并明确提示“刷新页面”**（HTML 与 JSON 双形态）。
 - ✅ 两场现行半决赛都有比分后才显示决赛选手；未满足时显示进度与原因。
-- ✅ 额外：单场换台、通用配对、决赛记分/冠军、完整 JSON API、15 个 pytest 用例、黑盒试跑脚本。
+- ✅ **修复重复排人**：重配时若所选球员已在另一场现行半决赛，立即退回并指出冲突场次
+  （JSON `sf_player_conflict` + `conflict_match_ids/conflicts`；表单 302 到 `/#match-<id>`
+  并 flash 冲突说明），从入口杜绝“一人两场 SF / 自己和自己打决赛”。
+- ✅ **并发重配安全**：`BEGIN IMMEDIATE` 串行写事务 + `busy_timeout` + 部分唯一索引，
+  两个裁判同时给两张空台排同一人只有一份成功（有自动化线程测试与 HTTP 并发剧本）。
+- ✅ **存量重复赛程网页标注**：首页/历史页红色横幅列出“球员 ↔ 冲突场次（球台）”，
+  卡片红框、徽标、球员名高亮；两场 SF 比分与历史比分照常可查。
+- ✅ **冲突期间冻结晋级/决赛记分/冠军**：即使两场胜者不同也不产生决赛名单；
+  决赛交分 409 `semifinal_conflict`，决赛页记分表单替换为暂停面板，冠军不展示。
+- ✅ **恢复闭环**：撤下重复场 → 补齐合规对阵与两场合规赛果 → 按有效胜者生成空白新决赛；
+  据冲突赛程产生的旧决赛以 `sf_conflict` 封存，比分 `4:3` 等在历史页/旧链接可查，之后新决赛
+  可正常记分并产生冠军。
+- ✅ 额外：单场换台、通用配对、决赛记分/冠军、完整 JSON API、**25 个 pytest 用例**、
+  三套纯标准库黑盒剧本（原有 32 项 + 冲突恢复 33 项 + 并发 44 项）与脏赛程注入脚本。
 
 ### 5.2 实际测了什么（都是本环境真实执行，非仅阅读代码）
 
-- ✅ `pytest -q`：**15 passed**。覆盖播种、连环套同胜场按抽签号排名、规则对阵、
-  整表非法时原子不写库、决赛选手显示条件、换台比分随人走、旧球台入口按 match_id/球员对解析、
-  撤下/历史可查/重配空白/旧页 409 且“刷新”、JSON `match_withdrawn`、
-  小组改排名时旧半决赛“空壳删除 / 有比分封存”、对调所需场次数量校验等。
-- ✅ `python scripts/e2e_trial.py http://127.0.0.1:5555`：对**真实 gunicorn
-  （2 workers + threads + `--preload`）+ 文件 SQLite** 跑纯 HTTP 黑盒剧本，
-  **32 项检查全部通过**，完整执行了题目点名的流程：
-  整表提交 → 排名/对阵正确 → 旧页面登记 3:1 → 对调球台（m1 移到二号台且 3:1 保留）→
-  用同一张旧页面更正为 3:2 成功 → 旧一号台上下文交分成功且记在原球员对名下 →
-  撤下 m1（比分 3:0 封存）→ 历史页可见 `3 : 0` → 原班两人重配出全新空白场次 →
-  **再用旧页面交分收到 409 + “刷新”提示，封存比分未被改动** → 新场记分 + 另一场记分 →
-  两位决赛选手（陈一鸣、林浩然）上首页。
-- ✅ 实跑 `docker-entrypoint.sh` 的初始化命令，确认生成 6 球员 / 6 小组赛 / 2 场 SF。
-- ✅ 用 PyYAML 解析校验 `docker-compose.yml`，并用 JSON 解析校验 Dockerfile exec-form `CMD`。
-- ✅ 所有 Python 文件 `py_compile` 通过；试跑期间 gunicorn 无 traceback / 500
-  （仅有一条本沙箱 `HOME` 不可写导致的 gunicorn 控制套接字权限提示，与业务无关）。
+环境说明：本沙箱 `python3` 无 pip/Flask，已用 `get-pip.py --target=/tmp/pylibs`
+把 `Flask 3.1.3 / gunicorn 27.0.1 / pytest 9.2.0` 装到独立目录并以
+`PYTHONPATH=/tmp/pylibs:/workspace` 运行；所有服务均为真实进程。
+
+- ✅ `python -m pytest -q`：**25 passed**。在原 15 个用例全绿的基础上新增 10 个：
+  重配撞人 JSON 409 且 `conflict_match_ids` 指向正确场次、表单 302 锚点 + flash、
+  withdrawn 源场次重配同样查重复、脏赛程标注与比分可见、冲突冻结晋级/决赛/冠军、
+  决赛 GET 面板与 HTML 409 `conflict-block-warning`、撤场恢复 + 旧决赛封存 + 新决赛冠军、
+  **重启 create_app 后脏赛程仍在且冲突决赛被 `sf_conflict` 封存**、
+  **两线程 Barrier 并发 `create_repair` 恰好一成一拒且球员只在一场 SF**、
+  不存在/已撤场次的交分与换台表单不再 500。
+- ✅ `scripts/e2e_trial.py` 对真实 **gunicorn（2 workers + 4 threads + `--preload`）
+  + 文件 SQLite(WAL)**：**32/32 通过**，原有换台/撤场/重配/旧页 409/决赛选手流程无回归。
+- ✅ `scripts/e2e_conflict_recovery.py --db-path <db>`：同一真实 gunicorn 上
+  **33/33 通过**，完整走了题目要求的网页试跑：
+  干净库重配撞人被退回且文案含 `#场次`、HTML 302 到 `/#match-<id>` →
+  注入旧 bug 脏赛程（#1 `1-5` 与 #3 `1-3` 重复排球员 1，两场胜者分别为 1、3，
+  决赛 #4 `1-3 (4:3)`）→ `/api/state` 冲突结构正确、首页/历史页冲突横幅与
+  `conflict-player-1`/`conflict-match-1/3`/徽标齐全、SF 比分 `3:1`、`1:3` 仍渲染 →
+  `final-suspended` 与无冠军块 → 决赛交分 409 `semifinal_conflict` 且 `5:4` 未写入、
+  #4 以 `sf_conflict` 封存保留 `4:3` → 网页撤下 #3 → API 补齐 `4-2` 并记 `2:3` →
+  有效胜者 `{1,2}`、生成 `1-2` 空白决赛、#4 仍封存、历史页可见 `4 : 3` →
+  新决赛 `3:2` 后冠军陈一鸣、首页冠军块恢复。
+- ✅ `scripts/e2e_concurrent_repair.py --rounds 10`：对真实 2-worker gunicorn
+  发起真 HTTP 并发，**44/44 通过**：每轮两个线程用 Barrier 同时请求
+  “1+3 排一号台 / 1+6 排二号台”，**每轮恰好 1 个 200、另 1 个 409
+  `sf_player_conflict` 且指出获胜场次**，轮后轮询 `/api/state` 不变量
+  “没有球员在 >1 场现行 SF、无冲突标记”恒成立；另含一组完全相同配对的并发对照（一成一 409）。
+- ✅ 额外加压：自写 5 轮 × 6 裁判同时提交（同球员、同台/异台混合），每轮仍恰好 1 份成功、
+  球员 1 只出现在 1 场 SF；落败方为 `sf_player_conflict` 或同对 `duplicate_active_pair`。
+- ✅ 试跑服务器日志：最终一轮全套验证期间 **0 Traceback、0 HTTP 500**。
+- ✅ 实跑 `docker-entrypoint.sh` 的初始化（临时 `DB_PATH`），确认生成
+  6 球员 / 6 小组赛 / 2 场 SF；`sh -n` 入口脚本语法通过。
+- ✅ 用 PyYAML 解析校验 `docker-compose.yml`（服务/端口/命名卷正确），用 JSON 解析校验
+  Dockerfile exec-form `CMD`（11 个 argv）；所有 Python 文件 `py_compile` 通过。
 
 ### 5.3 还有什么没做 / 已知边界（如实说明）
 
-- ⚠️ **本沙箱没有 docker / podman / 守护进程与 socket，无法在这里真正
-  `docker compose build && docker compose up`**。Compose/Dockerfile 仅做了静态校验，
-  并用与镜像相同的 `gunicorn ... wsgi:app` 命令在本机完整试跑；镜像内的 `pip install`
-  未实跑（但 `requirements.txt` 中的 Flask/gunicorn 已从 PyPI 在本机成功安装并验证）。
-  首次在有 Docker 的机器上构建时仍可能遇到网络/拉取基础镜像问题。
-- 未做登录、裁判身份与权限控制（定位为社区内网裁判台，拿到页面即可操作）。
+- ⚠️ **本沙箱没有 docker / podman / nerdctl，也没有 `/var/run/docker.sock`，
+  当前 uid 非 root、`apt-get` 无法加锁，因此无法在这里真正
+  `docker compose build && docker compose up`**。已做到的最接近验证：
+  静态校验 Compose/Dockerfile、实跑 entrypoint 播种，并用与镜像 CMD **完全相同**的
+  `gunicorn --bind … --workers 2 --threads 4 --preload wsgi:app`（同样的文件 SQLite+WAL）
+  跑了上述全部 HTTP/并发剧本。镜像内 `pip install` 与首次拉取 `python:3.12-slim` 未实跑
+  （Flask/gunicorn 已在本机从 PyPI 成功安装验证）；在有 Docker 的机器上按文首
+  “用 Docker Compose 做冲突/并发试跑”的命令即可复跑，若网络受限可能需要配置 pip 镜像源。
+- 并发保证面向“所有写入都经过本应用”的部署形态：靠 `BEGIN IMMEDIATE` 串行化
+  `create_repair` 的查重/占台/插入，外加 pair/table 两个部分唯一索引；**没有**再为
+  “球员在 SF 出现至多一次”加数据库表达式唯一索引或触发器——因为存量脏数据必须允许存在并被
+  网页标注，唯一索引会在脏库上创建失败、触发器则可能在冲突未撤前连比分更正也拦掉。
+  若有绕过应用直接写 SQLite 的运维脚本，需要自行遵守该不变量（或先停服务再写）。
+- 未做登录、裁判身份与权限控制（定位为社区内网裁判台，拿到页面即可操作），因此“两个裁判”
+  的并发测试不区分账号，只验证提交互斥。
 - 比分只记每场两个总数，未记录逐局小分、暂停、黄牌等明细。
 - 小组赛六场是固定行原地更新，**不保留每次修改的历史版本**；淘汰赛的撤下/对阵更新则有状态、
   原因与时间戳可追溯，但也不是完整审计日志。
-- 并发控制依赖 SQLite 事务 + `busy_timeout` + 两个部分唯一索引，没有实现乐观锁版本号；
-  “旧页面”裁决依据是稳定场次 id 与 active/withdrawn 状态（正合题面语义）。
+- “旧页面”裁决依据是稳定场次 id 与 active/withdrawn 状态；未实现乐观锁版本号。
 - 决赛/冠军为轻量加分项；未做季军赛、签表导出、打印海报、CSV 导出等。
 - 没有浏览器级/视觉自动化测试（环境无 Playwright/Node 测试链），页面为服务端渲染，
-  仅含确认框等少量原生 JS；未做多语言（仅中文）。
+  已用真实 HTML 内容断言替代视觉检查；仅含确认框等少量原生 JS；未做多语言（仅中文）。

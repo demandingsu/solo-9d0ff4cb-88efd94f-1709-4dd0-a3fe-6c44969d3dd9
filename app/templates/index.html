@@ -110,10 +110,48 @@
     </form>
   </div>
 
+  {% if sf_conflicts and sf_conflicts.has_conflict %}
+  <div class="alert alert-conflict conflict-banner" id="sf-conflicts"
+       role="alert" data-testid="sf-conflict-banner">
+    <strong>⛔ 检测到半决赛重复排人（赛程冲突）：</strong>
+    <ul class="conflict-list">
+      {% for item in sf_conflicts.players %}
+      <li data-testid="conflict-player-{{ item.player_id }}">
+        球员
+        <span class="player-conflict-mark">
+          <span class="draw-chip">{{ item.draw_no }}</span>{{ item.player_name }}
+        </span>
+        同时被排进
+        {% for cm in item.matches %}
+          <a class="conflict-match-link"
+             href="#match-{{ cm.id }}"
+             data-testid="conflict-match-{{ cm.id }}">{{ cm.ref_label }}</a>{% if not loop.last %}、{% endif %}
+        {% endfor %}
+        ——同一名球员只能参加一场半决赛。
+      </li>
+      {% endfor %}
+      {% for sm in sf_conflicts.self_matches %}
+      <li data-testid="self-match-{{ sm.id }}">
+        <a class="conflict-match-link" href="#match-{{ sm.id }}"
+           data-testid="conflict-match-{{ sm.id }}">{{ sm.ref_label }}</a>
+        把同一名球员排在了对阵双方（自己与自己比赛），该场不能产生有效胜者。
+      </li>
+      {% endfor %}
+    </ul>
+    <p class="conflict-actions-hint">
+      处理方式：到对应场次<strong>撤下重复/无效对阵</strong>，再用空台重新安排合规配对并补齐赛果。
+      冲突排除前：不产生决赛选手、<strong>决赛记分暂停</strong>、<strong>冠军不展示</strong>；
+      已有比分与决赛记录全部封存可查。
+    </p>
+  </div>
+  {% endif %}
+
   <div class="grid-2">
     {% for t in [1, 2] %}
     {% set m = tables[t] %}
-    <div class="card table-card" id="table-{{ t }}" data-testid="table-card-{{ t }}">
+    {% set card_conflict = sf_conflicts and m and (m.id in sf_conflicts.match_ids) %}
+    <div class="card table-card {{ 'card-conflict' if card_conflict else '' }}"
+         id="table-{{ t }}" data-testid="table-card-{{ t }}">
       <div class="table-card-head">
         <h3>{{ ['一', '二'][t-1] }}号台</h3>
         {% if t == 1 %}<span class="rule-tag" data-testid="rule-SF1">默认规则：A1 对 B2</span>
@@ -130,12 +168,21 @@
             <span class="badge badge-code">{{ m.bracket_code }}</span>
           {% endif %}
           <span class="badge badge-active">现行有效</span>
+          {% if card_conflict %}
+            <span class="badge badge-conflict"
+                  data-testid="conflict-badge-{{ m.id }}">⛔ 重复排人冲突场次</span>
+          {% endif %}
         </div>
 
         <div class="versus">
           <div class="vs-player">
             <span class="draw-chip">{{ m.player1_draw }}</span>
-            <span class="pname">{{ m.player1_name }}</span>
+            <span class="pname {{ 'player-conflict-mark' if sf_conflicts and m.player1_id in sf_conflicts.player_ids else '' }}"
+                  {% if sf_conflicts and m.player1_id in sf_conflicts.player_ids %}
+                  data-testid="conflict-player-name-{{ m.player1_id }}"{% endif %}>
+              {{ m.player1_name }}
+              {% if sf_conflicts and m.player1_id in sf_conflicts.player_ids %}<span class="conflict-inline">⚠重复排人</span>{% endif %}
+            </span>
             <span class="group-tag group-{{ m.player1_group }}">{{ m.player1_group }}组</span>
           </div>
           <div class="vs-score">
@@ -149,7 +196,12 @@
           </div>
           <div class="vs-player vs-player-right">
             <span class="group-tag group-{{ m.player2_group }}">{{ m.player2_group }}组</span>
-            <span class="pname">{{ m.player2_name }}</span>
+            <span class="pname {{ 'player-conflict-mark' if sf_conflicts and m.player2_id in sf_conflicts.player_ids else '' }}"
+                  {% if sf_conflicts and m.player2_id in sf_conflicts.player_ids %}
+                  data-testid="conflict-player-name-{{ m.player2_id }}"{% endif %}>
+              {% if sf_conflicts and m.player2_id in sf_conflicts.player_ids %}<span class="conflict-inline">⚠重复排人</span>{% endif %}
+              {{ m.player2_name }}
+            </span>
             <span class="draw-chip">{{ m.player2_draw }}</span>
           </div>
         </div>
@@ -196,7 +248,13 @@
   <div class="card">
     <h3>未分配球台的现行半决赛</h3>
     {% for m in untabled %}
-      <p>场次 #{{ m.id }}：{{ m.player1_name }} 对 {{ m.player2_name }}
+      <p id="match-{{ m.id }}"
+         class="{{ 'conflict-row-text' if sf_conflicts and m.id in sf_conflicts.match_ids else '' }}"
+         data-testid="untabled-match-{{ m.id }}">
+        场次 #{{ m.id }}：{{ m.player1_name }} 对 {{ m.player2_name }}
+        {% if sf_conflicts and m.id in sf_conflicts.match_ids %}
+          <span class="badge badge-conflict" data-testid="conflict-badge-{{ m.id }}">⛔ 重复排人冲突场次</span>
+        {% endif %}
         （<a href="{{ url_for('web.match_page', match_id=m.id) }}">打开记分页</a>）</p>
     {% endfor %}
   </div>
@@ -235,6 +293,13 @@
       {% if champion and champion.player %}
       <div class="champion" data-testid="champion">🏆 冠军：{{ champion.player.name }}</div>
       {% endif %}
+    {% elif finalists.conflict %}
+      <div class="final-suspended" data-testid="final-suspended">
+        <p class="pending pending-conflict">⛔ {{ finalists.message }}</p>
+        <p class="hint">当前现行半决赛已记分 {{ finalists.count_scored }} / {{ finalists.count_active }}；
+          但因重复排人冲突，<strong>晋级、决赛记分与冠军展示暂停</strong>。请按上方冲突提示撤场并补齐两场合规赛果。</p>
+        <p class="hint">此前据冲突赛程产生的决赛记录会在调和时封存，比分在“历史对阵”中仍可查询。</p>
+      </div>
     {% else %}
       <p class="pending" data-testid="finalists-pending">⏳ {{ finalists.message }}</p>
       <p class="hint">当前现行半决赛已记分 {{ finalists.count_scored }} / {{ finalists.count_active }}。</p>

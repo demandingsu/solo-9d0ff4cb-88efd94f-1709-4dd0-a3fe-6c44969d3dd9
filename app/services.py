@@ -104,11 +104,131 @@ def table_map(conn: sqlite3.Connection) -> dict[int, sqlite3.Row | None]:
     return by_table
 
 
+def _match_brief(m: sqlite3.Row, focus_player_id: int | None = None) -> dict:
+    """冲突提示里使用的场次摘要（纯 dict，可直接进 JSON / 模板）。"""
+    p1, p2 = m["player1_id"], m["player2_id"]
+    if focus_player_id is not None:
+        if p1 == focus_player_id:
+            opponent_id, opponent_name = p2, m["player2_name"]
+        elif p2 == focus_player_id:
+            opponent_id, opponent_name = p1, m["player1_name"]
+        else:
+            opponent_id, opponent_name = None, None
+    else:
+        opponent_id, opponent_name = None, None
+    table_no = m["table_no"]
+    return {
+        "id": m["id"],
+        "round": m["round"],
+        "table_no": table_no,
+        "table_label": (
+            f"{['一', '二'][table_no - 1]}号台" if table_no in (1, 2) else "未分配球台"
+        ),
+        "bracket_code": m["bracket_code"],
+        "player1_id": p1,
+        "player2_id": p2,
+        "player1_name": m["player1_name"],
+        "player2_name": m["player2_name"],
+        "score1": m["score1"],
+        "score2": m["score2"],
+        "opponent_id": opponent_id,
+        "opponent_name": opponent_name,
+        "matchup": f"{m['player1_name']} 对 {m['player2_name']}",
+        "ref_label": f"场次 #{m['id']}"
+        + (f"（{['一', '二'][table_no - 1]}号台）" if table_no in (1, 2) else ""),
+    }
+
+
+def semifinal_conflict_report(conn: sqlite3.Connection) -> dict:
+    """检测现行半决赛里的“重复排人”脏赛程。
+
+    两类冲突：
+      1. 同一名球员出现在两场或更多不同的现行半决赛；
+      2. 同一场里 player1_id == player2_id（自己和自己打）。
+
+    已有的重复赛程是历史脏数据，不能让页面/接口崩溃：本函数只做检测与标注，
+    比分照常可查；晋级/决赛/冠军由调用方据 ``has_conflict`` 暂停。
+    """
+    rows = active_semifinals(conn)
+    players = {p["id"]: p for p in list_players(conn)}
+
+    usage: dict[int, list[sqlite3.Row]] = {}
+    for m in rows:
+        for pid in {m["player1_id"], m["player2_id"]}:  # set 对自我对阵去重
+            if pid is not None:
+                usage.setdefault(pid, []).append(m)
+
+    player_items: list[dict] = []
+    player_ids: set[int] = set()
+    match_ids: set[int] = set()
+
+    for pid, ms in usage.items():
+        uniq = {m["id"]: m for m in ms}
+        if len(uniq) < 2:
+            continue
+        p = players.get(pid)
+        matches = [
+            _match_brief(m, pid)
+            for m in sorted(uniq.values(), key=lambda x: (x["id"] or 0))
+        ]
+        player_items.append(
+            {
+                "player_id": pid,
+                "player_name": p["name"] if p else f"球员#{pid}",
+                "draw_no": p["draw_no"] if p else None,
+                "group_name": p["group_name"] if p else None,
+                "matches": matches,
+                "match_ids": [m["id"] for m in matches],
+            }
+        )
+        player_ids.add(pid)
+        match_ids.update(m["id"] for m in matches)
+
+    self_items: list[dict] = []
+    for m in rows:
+        if m["player1_id"] is not None and m["player1_id"] == m["player2_id"]:
+            brief = _match_brief(m, m["player1_id"])
+            self_items.append(brief)
+            player_ids.add(m["player1_id"])
+            match_ids.add(m["id"])
+
+    messages: list[str] = []
+    for item in player_items:
+        refs = "、".join(x["ref_label"] for x in item["matches"])
+        messages.append(
+            f"球员 {item['player_name']} 同时被排进 {len(item['matches'])} "
+            f"场现行半决赛：{refs}。同一名球员只能参加一场半决赛。"
+        )
+    for brief in self_items:
+        messages.append(
+            f"{brief['ref_label']} 把同一名球员排在了对阵双方（自己与自己比赛），"
+            "该场次不能产生有效胜者。"
+        )
+
+    return {
+        "has_conflict": bool(player_items or self_items),
+        "players": player_items,
+        "self_matches": self_items,
+        "player_ids": sorted(player_ids),
+        "match_ids": sorted(match_ids),
+        "messages": messages,
+    }
+
+
 def finalists_state(conn: sqlite3.Connection) -> dict:
-    """只有“两场现行半决赛”且两场都有有效比分时，才给出决赛选手。"""
+    """只有“两场合规且现行的半决赛”且两场都有有效比分时，才给出决赛选手。
+
+    一旦检测到重复排人冲突（同一球员在两场现行半决赛 / 自己对自己），
+    即使两场比分的胜者不同，也一律暂停晋级：ready=False 且 conflict=True。
+    """
     sf = active_semifinals(conn)
     scored = [m for m in sf if winner_id(m) is not None]
-    ready = len(sf) == 2 and len(scored) == 2
+    conflict = semifinal_conflict_report(conn)
+    ready = (
+        not conflict["has_conflict"]
+        and len(sf) == 2
+        and len(scored) == 2
+    )
 
     winner_rows: list[dict] = []
     if ready:
@@ -126,7 +246,13 @@ def finalists_state(conn: sqlite3.Connection) -> dict:
                 }
             )
 
-    if ready:
+    if conflict["has_conflict"]:
+        message = (
+            "半决赛赛程存在重复排人冲突，晋级、决赛记分与冠军展示已暂停："
+            + " ".join(conflict["messages"])
+            + " 请先撤下重复场次，补齐两场合规半决赛及赛果。"
+        )
+    elif ready:
         message = "两场现行半决赛均已登记比分，决赛选手已产生。"
     elif len(sf) < 2:
         message = f"当前只有 {len(sf)} 场现行半决赛（另有对阵已撤下/待重新配对），补齐两场并登记比分后才显示决赛选手。"
@@ -135,6 +261,8 @@ def finalists_state(conn: sqlite3.Connection) -> dict:
 
     return {
         "ready": ready,
+        "conflict": conflict["has_conflict"],
+        "conflicts": conflict,
         "count_active": len(sf),
         "count_scored": len(scored),
         "winners": winner_rows,
@@ -154,6 +282,9 @@ def final_match(conn: sqlite3.Connection) -> sqlite3.Row | None:
 
 
 def champion(conn: sqlite3.Connection) -> dict | None:
+    # 冲突期间即使残留据脏赛程产生的 active 决赛，也不展示冠军。
+    if semifinal_conflict_report(conn)["has_conflict"]:
+        return None
     f = final_match(conn)
     if f is None or winner_id(f) is None:
         return None
@@ -171,6 +302,7 @@ def build_state(conn: sqlite3.Connection) -> dict:
         "desired_semifinals": desired,
         "tables": table_map(conn),
         "active_semifinals": active_semifinals(conn),
+        "sf_conflicts": semifinal_conflict_report(conn),
         "finalists": finalists_state(conn),
         "final_match": final_match(conn),
         "champion": champion(conn),
@@ -269,6 +401,12 @@ def reconcile_semifinals(conn: sqlite3.Connection) -> None:
     if not desired:
         return
 
+    # 已有“同一球员出现在两场现行半决赛 / 自己对自己”的脏赛程时，不做自动
+    # 调和：保留现场以便网页标注、裁判撤场处理，避免重启/整表提交把冲突痕迹
+    # 悄悄改掉。冲突排除后，下一次调和即恢复正常。
+    if semifinal_conflict_report(conn)["has_conflict"]:
+        return
+
     active = conn.execute(
         "SELECT * FROM matches WHERE round='SF' AND status='active'"
     ).fetchall()
@@ -336,6 +474,20 @@ def reconcile_final(conn: sqlite3.Connection) -> None:
         "SELECT * FROM matches WHERE round='F' AND status='active' ORDER BY id DESC"
     ).fetchall()
 
+    if fs.get("conflict"):
+        # 半决赛重复排人冲突未排除：不安排新决赛；任何现行决赛都是据冲突赛程
+        # 产生的——空白空壳删除，已录比分的以 sf_conflict 原因封存、仍可查询。
+        for m in current:
+            if m["score1"] is None and m["score2"] is None:
+                conn.execute("DELETE FROM matches WHERE id=?", (m["id"],))
+            else:
+                conn.execute(
+                    "UPDATE matches SET status='withdrawn',"
+                    " withdraw_reason='sf_conflict', withdrawn_at=? WHERE id=?",
+                    (now_iso(), m["id"]),
+                )
+        return
+
     if not fs["ready"]:
         # 选手尚未确定：未记分的空壳决赛记录删掉；记过分的封存
         for m in current:
@@ -381,6 +533,17 @@ class MatchGoneError(Exception):
         self.match = match
 
 
+class ScheduleConflictError(Exception):
+    """赛程存在重复排人等冲突，相关写操作（如决赛记分）被暂停。"""
+
+    code = "schedule_conflict"
+
+    def __init__(self, message: str, *, report: dict | None = None, match=None):
+        super().__init__(message)
+        self.report = report
+        self.match = match
+
+
 def record_score(
     conn: sqlite3.Connection, match_id: int, raw1: Any, raw2: Any
 ) -> sqlite3.Row:
@@ -393,6 +556,22 @@ def record_score(
             withdrawn=True,
             match=m,
         )
+
+    # 半决赛重复排人冲突期间：暂停决赛记分。先把据冲突赛程产生的现行决赛
+    # 封存（有比分保留可查），再以 409 + 冲突明细退回本次提交。
+    if m["round"] == "F":
+        report = semifinal_conflict_report(conn)
+        if report["has_conflict"]:
+            reconcile_final(conn)
+            conn.commit()
+            sealed = get_match(conn, match_id)
+            raise ScheduleConflictError(
+                "半决赛赛程存在重复排人冲突，晋级、决赛记分与冠军展示均已暂停；"
+                "该决赛记录已封存、比分保留可查。请先撤下重复场次并补齐两场合规半决赛与赛果。",
+                report=report,
+                match=sealed,
+            )
+
     s1, s2 = parse_score_pair(raw1, raw2)
     if s1 is None:
         raise ScoreError("半决赛/决赛必须登记完整比分（两格都填）。")
@@ -440,8 +619,13 @@ def swap_semifinal_tables(conn: sqlite3.Connection) -> bool:
 
 def move_to_table(conn: sqlite3.Connection, match_id: int, table_no: int) -> None:
     m = get_match(conn, match_id)
-    if m is None or m["status"] != "active":
-        raise MatchGoneError("场次不存在或已撤下，不能换台。", withdrawn=bool(m))
+    if m is None:
+        raise MatchGoneError("场次不存在，不能换台。")
+    if m["status"] != "active":
+        raise MatchGoneError(
+            "场次已撤下，不能换台；请刷新后按最新对阵操作。",
+            withdrawn=True, match=m,
+        )
     if table_no not in (1, 2):
         raise ScoreError("球台编号只能是 1 或 2。")
     other = conn.execute(
@@ -469,6 +653,25 @@ def withdraw_match(
     if m is None:
         return None
     if m["status"] == "active":
+        # 撤场前识别“本次撤下的正是重复排人冲突场次”。此时先把据冲突赛程
+        # 产生的现行有比分决赛以 sf_conflict 封存（比分保留），使恢复后历史
+        # 记录里的封存原因准确可辨；随后常规调和不会再改动这些已封存记录。
+        conflict_report = semifinal_conflict_report(conn)
+        resolving_conflict = (
+            m["round"] == "SF"
+            and conflict_report["has_conflict"]
+            and int(match_id) in conflict_report["match_ids"]
+        )
+        if resolving_conflict:
+            conn.execute(
+                """UPDATE matches
+                      SET status='withdrawn', withdraw_reason='sf_conflict',
+                          withdrawn_at=?, updated_at=?
+                    WHERE round='F' AND status='active'
+                      AND score1 IS NOT NULL AND score2 IS NOT NULL""",
+                (now_iso(), now_iso()),
+            )
+
         conn.execute(
             "UPDATE matches SET status='withdrawn', withdraw_reason=?,"
             " withdrawn_at=?, updated_at=? WHERE id=?",
@@ -487,6 +690,61 @@ class DuplicateActivePair(Exception):
         super().__init__(f"这两名球员已有现行场次 #{existing_id}。")
 
 
+class PlayerAlreadyScheduledError(ScheduleConflictError):
+    """重配被退回：该球员已在另一场现行半决赛中。"""
+
+    code = "sf_player_conflict"
+
+    def __init__(self, items: list[dict]):
+        self.items = items
+        parts: list[str] = []
+        match_ids: set[int] = set()
+        for it in items:
+            refs = "、".join(x["ref_label"] for x in it["matches"])
+            parts.append(f"球员 {it['player_name']} 已在另一场现行半决赛 {refs}")
+            match_ids.update(it["match_ids"])
+        self.conflict_match_ids = sorted(match_ids)
+        message = (
+            "提交已退回："
+            + "；".join(parts)
+            + "。同一名球员不能同时被排进两场半决赛，否则可能出现“自己和自己打决赛”。"
+            "请先撤下或改配冲突场次，再重新提交。"
+        )
+        super().__init__(
+            message,
+            report={
+                "has_conflict": True,
+                "players": items,
+                "self_matches": [],
+                "player_ids": [it["player_id"] for it in items],
+                "match_ids": sorted(match_ids),
+                "messages": [message],
+            },
+        )
+
+
+def _player_active_sf_matches(
+    conn: sqlite3.Connection, player_id: int
+) -> list[sqlite3.Row]:
+    """该球员目前参加的全部现行半决赛（正常赛程下至多 1 场）。"""
+    return conn.execute(
+        """
+        SELECT m.*,
+               p1.name AS player1_name, p1.draw_no AS player1_draw,
+               p1.group_name AS player1_group,
+               p2.name AS player2_name, p2.draw_no AS player2_draw,
+               p2.group_name AS player2_group
+          FROM matches m
+          LEFT JOIN players p1 ON p1.id = m.player1_id
+          LEFT JOIN players p2 ON p2.id = m.player2_id
+         WHERE m.round = 'SF' AND m.status = 'active'
+           AND ? IN (m.player1_id, m.player2_id)
+         ORDER BY m.id
+        """,
+        (player_id,),
+    ).fetchall()
+
+
 def create_repair(
     conn: sqlite3.Connection,
     *,
@@ -496,61 +754,118 @@ def create_repair(
     source_id: int | None = None,
     round_name: str = "SF",
 ) -> int:
-    """让两人重新配到一起：一定创建空白新场次，绝不继承旧比分。"""
-    if int(player1_id) == int(player2_id):
-        raise ScoreError("重新配对需要选择两名不同的球员。")
-    players = {p["id"] for p in list_players(conn)}
-    if int(player1_id) not in players or int(player2_id) not in players:
+    """让两人重新配到一起：一定创建空白新场次，绝不继承旧比分。
+
+    半决赛还强制“一名球员至多出现在一场现行半决赛”。查重 + 占台 + 插入放在
+    ``BEGIN IMMEDIATE`` 串行写事务里：两个裁判并发给两张空台排同一名球员时，
+    只有先拿到写锁的事务能成功，后一个会看到前者已提交的排人并被退回。
+    """
+    try:
+        p1 = int(player1_id)
+        p2 = int(player2_id)
+    except (TypeError, ValueError):
         raise ScoreError("请选择两名内置球员。")
 
-    key = pair_key(player1_id, player2_id)
-    dup = conn.execute(
-        "SELECT id FROM matches WHERE round=? AND status='active' AND pair_key=?",
-        (round_name, key),
-    ).fetchone()
-    if dup is not None:
-        raise DuplicateActivePair(dup["id"])
+    if p1 == p2:
+        raise ScoreError("重新配对需要选择两名不同的球员。")
+    players = {p["id"] for p in list_players(conn)}
+    if p1 not in players or p2 not in players:
+        raise ScoreError("请选择两名内置球员。")
 
-    # 球台选择：指定台必须为空；未指定则用源场次旧台（若空）或第一张空台；
-    # 两张台都满时拒绝再建，保证“两场现行半决赛”的业务不变量。
-    occupied = {
-        r["table_no"]
-        for r in conn.execute(
-            "SELECT table_no FROM matches WHERE round=? AND status='active'"
-            " AND table_no IS NOT NULL",
-            (round_name,),
-        ).fetchall()
-    }
-    source = get_match(conn, source_id) if source_id else None
-    chosen: int | None = None
-    if table_no in (1, 2):
-        if int(table_no) in occupied:
-            raise ScoreError(f"{table_no} 号台已有现行对阵，请先撤下该场或使用对调。")
-        chosen = int(table_no)
-    elif source is not None and source["table_no"] in (1, 2) \
-            and source["table_no"] not in occupied:
-        chosen = source["table_no"]
+    key = pair_key(p1, p2)
+
+    new_id: int | None = None
+    # 先拿写锁再查重，杜绝“两边都查不到、随后都插入”的并发窗口。
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        dup = conn.execute(
+            "SELECT id FROM matches WHERE round=? AND status='active' AND pair_key=?",
+            (round_name, key),
+        ).fetchone()
+        if dup is not None:
+            raise DuplicateActivePair(dup["id"])
+
+        # 关键不变量：半决赛阶段，同一名球员不能出现在另一场现行半决赛。
+        if round_name == "SF":
+            overlap_items: list[dict] = []
+            for pid in (p1, p2):
+                rows = _player_active_sf_matches(conn, pid)
+                if not rows:
+                    continue
+                p = conn.execute(
+                    "SELECT * FROM players WHERE id=?", (pid,)
+                ).fetchone()
+                overlap_items.append(
+                    {
+                        "player_id": pid,
+                        "player_name": p["name"] if p else f"球员#{pid}",
+                        "draw_no": p["draw_no"] if p else None,
+                        "group_name": p["group_name"] if p else None,
+                        "matches": [_match_brief(r, pid) for r in rows],
+                        "match_ids": [r["id"] for r in rows],
+                    }
+                )
+            if overlap_items:
+                raise PlayerAlreadyScheduledError(overlap_items)
+
+        # 球台选择：指定台必须为空；未指定则用源场次旧台（若空）或第一张空台；
+        # 两张台都满时拒绝再建，保证“两场现行半决赛”的业务不变量。
+        occupied = {
+            r["table_no"]
+            for r in conn.execute(
+                "SELECT table_no FROM matches WHERE round=? AND status='active'"
+                " AND table_no IS NOT NULL",
+                (round_name,),
+            ).fetchall()
+        }
+        source = get_match(conn, source_id) if source_id else None
+        chosen: int | None = None
+        if table_no in (1, 2):
+            if int(table_no) in occupied:
+                raise ScoreError(f"{table_no} 号台已有现行对阵，请先撤下该场或使用对调。")
+            chosen = int(table_no)
+        elif source is not None and source["table_no"] in (1, 2) \
+                and source["table_no"] not in occupied:
+            chosen = source["table_no"]
+        else:
+            for t in (1, 2):
+                if t not in occupied:
+                    chosen = t
+                    break
+            if chosen is None and round_name == "SF":
+                raise ScoreError("两张球台都有现行半决赛，请先撤下其中一场再重新配对。")
+
+        # 重配场次 bracket_code 置为 'REPAIR'，表明它是人工重配
+        # （调和时优先封存而非删除）。
+        new_id = _insert_match(
+            conn,
+            round_name=round_name,
+            code="REPAIR",
+            table_no=chosen,
+            p1=p1,
+            p2=p2,
+        )
+    except sqlite3.IntegrityError as exc:
+        # 部分唯一索引是最后一道兜底（并发写入 / 绕过本函数的路径）。
+        conn.rollback()
+        dup = conn.execute(
+            "SELECT id FROM matches WHERE round=? AND status='active' AND pair_key=?",
+            (round_name, key),
+        ).fetchone()
+        if dup is not None:
+            raise DuplicateActivePair(dup["id"]) from exc
+        raise ScoreError(
+            "提交冲突：同一对球员或同一张球台可能刚被另一位裁判占用，请刷新后重试。"
+        ) from exc
+    except BaseException:
+        conn.rollback()
+        raise
     else:
-        for t in (1, 2):
-            if t not in occupied:
-                chosen = t
-                break
-        if chosen is None and round_name == "SF":
-            raise ScoreError("两张球台都有现行半决赛，请先撤下其中一场再重新配对。")
+        conn.commit()
 
-    # 重配场次 bracket_code 置空、withdraw_reason 借用为来源标记不合适，
-    # 用 bracket_code='REPAIR' 表明它是人工重配（调和时优先封存而非删除）。
-    new_id = _insert_match(
-        conn,
-        round_name=round_name,
-        code="REPAIR",
-        table_no=chosen,
-        p1=int(player1_id),
-        p2=int(player2_id),
-    )
-    conn.commit()
     reconcile_final(conn)
     conn.commit()
+    assert new_id is not None
     return new_id
 
 

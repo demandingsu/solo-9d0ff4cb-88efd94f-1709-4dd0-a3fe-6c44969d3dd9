@@ -45,6 +45,24 @@
     <div class="alert alert-error" data-testid="score-error">{{ error }}</div>
     {% endif %}
 
+    {% if conflict_message %}
+    <div class="alert alert-conflict" role="alert" data-testid="conflict-block-warning">
+      <strong>⛔ 提交被退回（赛程冲突）：</strong>{{ conflict_message }}
+      {% if conflict_report and conflict_report.messages %}
+      <ul class="conflict-list">
+        {% for msg in conflict_report.messages %}<li>{{ msg }}</li>{% endfor %}
+      </ul>
+      {% endif %}
+      <div class="stale-actions">
+        <a class="btn btn-primary"
+           href="{{ url_for('web.index') }}#sf-conflicts">查看并处理冲突场次</a>
+        <button type="button" class="btn btn-ghost"
+                onclick="window.location.reload()">刷新本页</button>
+      </div>
+      <p class="hint">错误代码：409 semifinal_conflict · 冲突排除并补齐两场合规赛果后，才会按有效胜者安排新决赛。</p>
+    </div>
+    {% endif %}
+
     <div class="versus versus-lg">
       <div class="vs-player">
         <span class="draw-chip">{{ m.player1_draw }}</span>
@@ -65,7 +83,9 @@
       </div>
     </div>
 
-    {% if m.status == 'active' %}
+    {% set final_blocked = (m.status == 'active' and m.round == 'F'
+                            and conflict_report and conflict_report.has_conflict) %}
+    {% if m.status == 'active' and not final_blocked %}
       <form method="post" class="score-form score-form-lg"
             action="{{ url_for('web.match_score', match_id=m.id) }}"
             data-testid="score-form-{{ m.id }}">
@@ -100,12 +120,24 @@
                   data-testid="withdraw-{{ m.id }}">撤下对阵</button>
         </form>
       </div>
+    {% elif final_blocked %}
+      <div class="alert alert-conflict final-blocked-box"
+           data-testid="final-score-blocked">
+        <h3>⛔ 冲突期间决赛记分已暂停</h3>
+        <p>检测到现行半决赛存在重复排人冲突（同一球员出现在两场半决赛，或自己对自己）。
+          即使两场都已分出胜负，也不能据此晋级、记决赛比分或展示冠军。</p>
+        <p>请先到裁判台撤下冲突场次，补齐两场合规半决赛与赛果；系统会按有效胜者生成新的空白决赛，
+          此前据冲突赛程产生的决赛比分将封存、可在历史对阵中查询。</p>
+        <a class="btn btn-primary"
+           href="{{ url_for('web.index') }}#sf-conflicts">前往处理半决赛冲突</a>
+      </div>
     {% else %}
       <div class="sealed-box" data-testid="sealed-box">
         <h3>该场次已撤下，比分封存保留、仍可查询</h3>
         <p>
           撤下原因：
           {% if m.withdraw_reason == 'lineup_update' %}小组重新整表提交后对阵更新
+          {% elif m.withdraw_reason == 'sf_conflict' %}半决赛重复排人冲突，决赛暂停/封存
           {% else %}裁判手动撤场{% endif %}
           ；撤下时间：{{ m.withdrawn_at or '—' }}
         </p>

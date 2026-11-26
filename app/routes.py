@@ -15,6 +15,8 @@ from .db import get_db
 from .services import (
     DuplicateActivePair,
     MatchGoneError,
+    PlayerAlreadyScheduledError,
+    ScheduleConflictError,
     active_semifinals,
     build_state,
     champion,
@@ -26,6 +28,7 @@ from .services import (
     record_score,
     repair_from_withdrawn,
     save_group_scores,
+    semifinal_conflict_report,
     swap_semifinal_tables,
     table_map,
     withdraw_match,
@@ -114,6 +117,7 @@ def state_payload(conn) -> dict:
         "desired_semifinals": s["desired_semifinals"],
         "tables": {str(k): match_to_dict(v) for k, v in s["tables"].items()},
         "active_semifinals": [match_to_dict(r) for r in s["active_semifinals"]],
+        "sf_conflicts": s["sf_conflicts"],
         "finalists": s["finalists"],
         "final_match": match_to_dict(s["final_match"]),
         "champion": s["champion"],
@@ -139,22 +143,31 @@ def index():
 
 @bp.get("/matches/<int:match_id>")
 def match_page(match_id: int):
-    m = get_match(get_db(), match_id)
+    conn = get_db()
+    m = get_match(conn, match_id)
     if m is None:
         if wants_json():
             return jsonify(ok=False, error="not_found"), 404
         return render_template("404.html"), 404
-    return render_template("match.html", m=m, stale_message=None, error=None,
-                           draft1="", draft2="")
+    return render_template(
+        "match.html", m=m, stale_message=None, error=None,
+        conflict_message=None,
+        conflict_report=semifinal_conflict_report(conn),
+        draft1="", draft2="",
+    )
 
 
 @bp.get("/history")
 def history():
-    rows = list_matches(get_db())
-    players = get_db().execute(
+    conn = get_db()
+    rows = list_matches(conn)
+    players = conn.execute(
         "SELECT * FROM players ORDER BY group_name, draw_no"
     ).fetchall()
-    return render_template("history.html", matches=rows, players=players)
+    return render_template(
+        "history.html", matches=rows, players=players,
+        sf_conflicts=semifinal_conflict_report(conn),
+    )
 
 
 @bp.get("/api/state")
@@ -215,6 +228,21 @@ def _score_response(match_id: int, a, b):
     js = wants_json()
     try:
         m = record_score(conn, match_id, a, b)
+    except ScheduleConflictError as exc:
+        if js:
+            return jsonify(
+                ok=False,
+                error="semifinal_conflict",
+                code="semifinal_conflict",
+                message=str(exc),
+                conflicts=exc.report,
+            ), 409
+        return render_template(
+            "match.html", m=exc.match or get_match(conn, match_id),
+            stale_message=None, error=None,
+            conflict_message=str(exc), conflict_report=exc.report,
+            draft1=a, draft2=b,
+        ), 409
     except MatchGoneError as exc:
         if js:
             return jsonify(
@@ -225,9 +253,13 @@ def _score_response(match_id: int, a, b):
                 match_id=match_id,
                 refresh_url=url_for("web.index"),
             ), 409
+        if exc.match is None:
+            return render_template("404.html"), 404
         return render_template(
             "match.html", m=exc.match, stale_message=str(exc),
-            error=None, draft1="", draft2=""
+            error=None, conflict_message=None,
+            conflict_report=semifinal_conflict_report(conn),
+            draft1="", draft2=""
         ), 409
     except ScoreError as exc:
         if js:
@@ -236,6 +268,8 @@ def _score_response(match_id: int, a, b):
         m = get_match(conn, match_id)
         return render_template(
             "match.html", m=m, stale_message=None, error=str(exc),
+            conflict_message=None,
+            conflict_report=semifinal_conflict_report(conn),
             draft1=a, draft2=b
         ), 400
 
@@ -368,9 +402,14 @@ def change_table(match_id: int):
         if wants_json():
             return jsonify(ok=False, code="match_withdrawn",
                            message=str(exc)), 409
+        if exc.match is None:
+            flash(str(exc), "err")
+            return redirect(url_for("web.index"))
         return render_template(
             "match.html", m=exc.match, stale_message=str(exc),
-            error=None, draft1="", draft2=""
+            error=None, conflict_message=None,
+            conflict_report=semifinal_conflict_report(conn),
+            draft1="", draft2="",
         ), 409
     else:
         flash(f"场次 #{match_id} 已调到 {table_no} 号台，比分照旧保留。", "ok")
@@ -413,6 +452,17 @@ def re_pair(match_id: int):
     table_no = int(raw_table) if str(raw_table).strip() in ("1", "2") else None
     try:
         new_id = repair_from_withdrawn(conn, match_id, table_no=table_no)
+    except PlayerAlreadyScheduledError as exc:
+        if wants_json():
+            return jsonify(ok=False, error="player_already_scheduled",
+                           code="sf_player_conflict",
+                           conflict_match_ids=exc.conflict_match_ids,
+                           conflicts=exc.report,
+                           message=str(exc)), 409
+        flash(str(exc), "err")
+        anchor = (f"#match-{exc.conflict_match_ids[0]}"
+                  if exc.conflict_match_ids else "#sf-conflicts")
+        return redirect(url_for("web.index") + anchor)
     except DuplicateActivePair as exc:
         if wants_json():
             return jsonify(ok=False, error="duplicate_active_pair",
@@ -457,6 +507,17 @@ def create_pairing():
             player2_id=int(p2),
             table_no=table_no,
         )
+    except PlayerAlreadyScheduledError as exc:
+        if wants_json():
+            return jsonify(ok=False, error="player_already_scheduled",
+                           code="sf_player_conflict",
+                           conflict_match_ids=exc.conflict_match_ids,
+                           conflicts=exc.report,
+                           message=str(exc)), 409
+        flash(str(exc), "err")
+        anchor = (f"#match-{exc.conflict_match_ids[0]}"
+                  if exc.conflict_match_ids else "#sf-conflicts")
+        return redirect(url_for("web.index") + anchor)
     except DuplicateActivePair as exc:
         if wants_json():
             return jsonify(ok=False, error="duplicate_active_pair",
